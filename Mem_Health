@@ -1,0 +1,258 @@
+#!/bin/sh 
+# Cpu_load monitoring
+# Author:	Qi.li		
+# Support:	qi.li@cs2c.com.cn
+# License:	GNU General Public License (GPL)
+# Copyright:	(C) 2014 CS2C
+# Last modify    2014-10-15
+# See usage() function below for more details...
+# OCF instance parameters:
+# Initialization:
+
+OCF_ROOT=/usr/lib/ocf
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+#######################################################################
+mem_free_fixed_red_limit=$OCF_RESKEY_idle_ratio_red_limit
+mem_free_fixed_red_limit=`echo $mem_free_fixed_red_limit|awk -F "M"  '{print $1}'`
+mem_free_fixed_yellow_limit=$OCF_RESKEY_idle_ratio_yellow_limit
+mem_free_fixed_yellow_limit=`echo $mem_free_fixed_yellow_limit|awk -F "M"  '{print $1}'`
+CONFIG_DIR_NAME=/opt/systemcenter2.8/api/rest/config/config.conf
+usage() {
+  cat <<UEND
+	usage: $0 (start|stop|validate-all|meta-data|monitor)
+	$0 manages a free-memory as an HA resource.
+	The 'start' operation starts monitoring the free-memory.
+	The 'stop' operation stops the monitoring the free-memory.
+	The 'status' operation reports whether the free-memory.
+	The 'monitor' operation reports whether the free-memory is normals
+	The 'validate-all' operation reports whether the parameters are valid
+UEND
+}
+
+meta_data() {
+	cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="free-memory">
+<version>1.0</version>
+
+<longdesc lang="en">
+Resource script for free-memory. 
+It manages free memory as an HA resource.
+</longdesc>
+<shortdesc lang="en">free memory resource agent</shortdesc>
+
+<parameters>
+
+<parameter name="idle_ratio_red_limit" unique="1" required="1">
+<longdesc lang="en">
+If free memory reach(or less than) the fixed red limit(Unit M),the node will send the red signal to cluster.
+</longdesc>
+<shortdesc lang="en">free-memory-ratio for red-light-limit </shortdesc>
+<content type="string" default="200M" />
+</parameter>
+<parameter name="idle_ratio_yellow_limit" unique="1" required="1">
+<longdesc lang="en">
+If free memory  reach(or less than) the fixed yellow limit(Unit M), the node will send the yellow signal to cluster.
+</longdesc>
+<shortdesc lang="en">free-memory-ratio for red-yellow-limit </shortdesc>
+<content type="string" default="500M" />
+</parameter>
+
+</parameters>
+
+<actions>
+<action name="start" timeout="30" />
+<action name="stop" timeout="30" />
+<action name="monitor" depth="0" timeout="100" interval="60" start-delay="10" />
+<action name="validate-all" timeout="5" />
+<action name="meta-data" timeout="5" />
+</actions>
+</resource-agent>
+END
+}
+
+
+mem_loads_validate() {
+# checking the parameters
+    if [ ! -f  "/etc/init.d/neokylinha" ];then
+       ocf_log err  "the computer is not installed the HA, please check !"
+       exit $OCF_ERR_INSTALLED;
+    fi
+       return $OCF_SUCCESS
+}
+
+
+mem_avg_free()
+{
+    ####  total    total  used   free  shared  buffers  cached#####
+    local SUM=0
+    SYS_MEM_FREE=0
+    local mem_free_array=(0 0 0 0 0 )
+    for i in {1..5}
+    do
+        mem_info=`free |grep -i Mem`
+        mem_free=`echo $mem_info |cut -d ' ' -f 4`
+        mem_free_array[4]=${mem_free_array[3]}
+        mem_free_array[3]=${mem_free_array[2]}
+        mem_free_array[2]=${mem_free_array[1]}
+        mem_free_array[1]=${mem_free_array[0]}
+        mem_free_array[0]=$mem_free
+        sleep 1
+   done
+   for i in {0..4}
+   do
+      let SUM=$SUM+${mem_free_array[$i]}
+   done
+   let SYS_MEM_FREE=$SUM/5
+   #echo $SYS_MEM_FREE
+   return $SYS_MEM_FREE
+
+}
+
+remote_server_db_monitor()
+{
+    ###########check the db status########################################
+    ###input para:null####################################################
+    ###return para: 0 means the node can connect the db server ##########
+    ###return para:1  means the node can not connect the db server#######
+    #############us the command named nc to connect the db server#########
+    ####if db server is not running,or something wrong with the network###
+    ####the return infor for nc failed find the keyword succeeded#########
+    #####if the db server is running,and the network is fine##############
+    #####the keyword succeeded will be finded in the return info for nc.##
+    #####if the keyword succeeded is not finded in the return info for nc#
+    #####then create the warnning info and backup it on local node ######
+    #####as the node failed connect to the db server#####################
+    #####the process do not need send the warnning info to db############
+    local config_file_name=$CONFIG_DIR_NAME
+    remote_server_db_ip=`grep -i 'db_host' $config_file_name|awk -F "=" '{print $2}'`
+    remote_server_db_port=`grep -i 'db_port' $config_file_name|awk -F "=" '{print $2}'`
+    local YEAR=`date +%Y`
+    local MONTH=`date +%m`
+    local DAY=`date +%d`
+    local TIME_WARNNING=`date '+%Y-%m-%d'`
+    local TIME=`date +%H:%M:%S`
+    local SYSTEM_TIME=`date '+%Y-%m-%d %T'`
+    local TIME_STR="'$SYSTEM_TIME'"
+    local WARMMING_LEVEL=[2d01]
+    local READ_DONE=0
+    local NODE_NAME=`hostname`
+    WARMMING_DETAIL="$NODE_NAME failed  connect to the database server.Please check the network and the db server."
+    if [ -e  /var/log/ha_crm_mon.log ];then
+        touch /var/log/ha_crm_mon.log
+    fi
+    find_the_db_erro_in_one_day=`cat  /var/log/ha_crm_mon.log |grep "2d01" |grep $TIME_WARNNING`
+    remote_server_db_status_info=`nc -v -w 10 -z $remote_server_db_ip $remote_server_db_port 2>/dev/null`
+    check_remote_server_db_is_running=`echo  $remote_server_db_status_info  |grep -i succeeded`
+    if [ X"$check_remote_server_db_is_running" = X"" -a  X"$find_the_db_erro_in_one_day" = X""  ];then
+         echo $WARMMING_LEVEL  $SYSTEM_TIME $WARMMING_DETAIL  >> /var/log/ha_crm_mon.log
+         echo $WARMMING_LEVEL  $SYSTEM_TIME $WARMMING_DETAIL  >> /var/log/ha_warning_db.log
+         return 1
+    else
+         return 0
+    fi
+    return 1
+}
+
+
+mem_free_warnning()
+{
+    local config_file_name=$CONFIG_DIR_NAME
+    local remote_server_db_ip=`grep -i 'db_host' $config_file_name|awk -F "=" '{print $2}'`
+    local remote_server_db_port=`grep -i 'db_port' $config_file_name|awk -F "=" '{print $2}'`
+    local YEAR=`date +%Y`
+    local MONTH=`date +%m`
+    local DAY=`date +%d`
+    local TIME=`date +%H:%M:%S`
+    local SYSTEM_TIME=`date '+%Y-%m-%d %T'`
+    local TIME_STR="'$SYSTEM_TIME'"
+    local WARMMING_LEVEL="2x${3}"
+    local READ_DONE=0
+    local NODE_NAME=`hostname`
+    local WARMMING_DETAIL="$NODE_NAME free memory is $1M, where less the threshold $2M."
+    remote_server_db_status_info=`nc -v -w 10 -z $remote_server_db_ip $remote_server_db_port 2>/dev/null`
+    check_remote_server_db_is_running=`echo  $remote_server_db_status_info  |grep -i succeeded`
+    if [ -e $CONFIG_DIR_NAME ];then
+        web_service_port=`cat $CONFIG_DIR_NAME |grep -A2 "\[server\]" |grep server_port|awk -F "=" '{print $2}'`
+        web_service_port=`echo $web_service_port`
+        remote_server_db_status_info=`nc -v -w 5 -z $remote_server_db_ip $remote_server_db_port 2>/dev/null`
+        check_remote_server_db_is_running=`echo  $remote_server_db_status_info  |grep -i succeeded`
+        if [ X"$check_remote_server_db_is_running" = X""  ];then
+             WARMMING_LEVEL_LOG="[2x${3}1]"
+             echo $WARMMING_LEVEL_LOG  $SYSTEM_TIME $WARMMING_DETAIL  >> /var/log/ha_warning_db.log
+             echo $WARMMING_LEVEL_LOG  $SYSTEM_TIME $WARMMING_DETAIL  >> /var/log/ha_crm_mon.log
+             return 1
+        else
+             WARMMING_LEVEL_LOG="[2x${3}0]"
+             DATA=\"level\":\"${WARMMING_LEVEL}\",\"read\":0,\"year\":${YEAR},\"detail\":\"${WARMMING_DETAIL}\",\"month\":${MONTH},\"time\":\"${TIME}\",\"day\":${DAY}
+             DATA={${DATA}}
+             ret=`curl -s -H "Content-Type:application/json" -d "${DATA}"  http://127.0.0.1:${web_service_port}/api/notifications`
+             FIND_ACTION_TRUE=`echo $ret |grep "true"`
+             if [ X"$FIND_ACTION_TRUE" = X"" ];then
+               WARMMING_LEVEL_LOG="[2x${3}1]"
+               echo $WARMMING_LEVEL_LOG $SYSTEM_TIME $WARMMING_DETAIL  >> /var/log/ha_warning_db.log
+             fi
+             echo $WARMMING_LEVEL_LOG  $SYSTEM_TIME $WARMMING_DETAIL  >> /var/log/ha_crm_mon.log
+             return 2
+        fi
+    else
+        echo $WARMMING_LEVEL_LOG  $SYSTEM_TIME $WARMMING_DETAIL  >> /var/log/ha_crm_mon.log
+        return 3
+    fi
+    return 0
+}
+
+
+mem_loads_monitor() {
+    local mem_free_M=0
+    if [ -e $CONFIG_DIR_NAME ];then
+        remote_server_db_monitor
+    fi
+    mem_avg_free
+    let mem_free_M=$SYS_MEM_FREE/1024
+    if [ $mem_free_M -lt $mem_free_fixed_red_limit ];then
+        attrd_updater -n "#health-mem" -U "red" -d "30s"
+        if [ -f $CONFIG_DIR_NAME ];then
+            mem_free_warnning $mem_free_M  $mem_free_fixed_red_limit 0
+        fi
+        return $OCF_SUCCESS
+    fi
+    if [ $mem_free_M -lt $mem_free_fixed_yellow_limit -a  $mem_free_M  -gt $mem_free_fixed_red_limit ];then
+        attrd_updater -n "#health-mem" -U "yellow" -d "30s" 1
+        mem_free_warnning $mem_free_M  $mem_free_fixed_yellow_limit 1
+        return $OCF_SUCCESS
+    fi
+    if [ $mem_free_M -gt $mem_free_fixed_yellow_limit ];then
+        attrd_updater -n "#health-mem" -U "green" -d "30s"
+        #mem_free_warnning $mem_free_M  $mem_free_fixed_red_limit 0     ####this line  for test
+        return $OCF_SUCCESS
+    fi
+    return $OCF_SUCCESS
+}
+
+mem_loads_start() {
+    return $OCF_SUCCESS
+}
+
+mem_loads_stop() {	
+   return $OCF_SUCCESS
+}
+# What kind of method was invoked?
+#set -x
+case "$1" in
+  start)         mem_loads_validate; 
+                 mem_loads_start;;
+  stop)		 mem_loads_stop;;
+  monitor)       mem_loads_validate; 
+                 mem_loads_monitor;;
+
+  meta-data)	 meta_data; exit $OCF_SUCCESS;;
+  validate-all)	 mem_loads_validate; exit $OCF_SUCCESS;;
+
+ *)		 usage
+		 exit $OCF_ERR_UNIMPLEMENTED;;
+esac
+exit $?
